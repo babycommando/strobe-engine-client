@@ -1,0 +1,8 @@
+[package]
+name = "h3-hello"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quiche = "0.24"
+

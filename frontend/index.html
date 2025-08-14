@@ -1,0 +1,254 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Strobe — Ingest + Search (binary, no JSON)</title>
+<style>
+  body { background:#0b0b0c; color:#eee; font:14px/1.4 system-ui, sans-serif; margin:0; }
+  .wrap { max-width:920px; margin:32px auto; padding:0 16px; }
+  h2 { margin:10px 0 8px; }
+  fieldset { border:1px solid #222; border-radius:12px; padding:12px; margin:14px 0 20px; background:#111215; }
+  legend { padding:0 6px; color:#bbb; }
+  .row{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:8px 0; }
+  input[type=text], input[type=number]{ padding:10px 12px; border-radius:10px; border:1px solid #333; background:#141416; color:#fff; outline:none; }
+  input[type=text]{ min-width:220px; flex:1; }
+  button { background:#ff4d00; color:#000; border:none; padding:10px 14px; border-radius:10px; font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .hits{ margin-top:12px; }
+  .hit{ padding:10px 12px; border:1px solid #222; border-radius:12px; margin-bottom:10px; background:#121214; }
+  .small{ color:#8a8a8a; font-size:12px; }
+  a { color:#ff4d00; text-decoration:none; }
+  code{ background:#1a1b1e; padding:2px 6px; border-radius:6px; }
+</style>
+<div class="wrap">
+  <h2>Strobe — binary ingest + search</h2>
+  <div class="small">No JSON. Query grams computed client-side. Metadata is never indexed.</div>
+
+  <fieldset>
+    <legend>Ingest (atomic packed)</legend>
+    <div class="row">
+      <label>endpoint <input id="base" type="text" value="https://127.0.0.1:7700"></label>
+      <label>id <input id="gid" type="number" value="4294967295" title="4294967295 = auto id"></label>
+      <label>title <input id="title" type="text" placeholder="Title"></label>
+      <label>author <input id="author" type="text" placeholder="Author"></label>
+    </div>
+    <div class="row">
+      <label style="flex:1">genres <input id="genres" type="text" placeholder="space-separated"></label>
+      <label style="flex:1">url <input id="url" type="text" placeholder="https://…"></label>
+      <label style="flex:1">uri <input id="uri" type="text" placeholder="disco://…"></label>
+      <button id="ingestBtn">Ingest</button>
+    </div>
+    <div class="small">Indexed/searchable string sent as <code>search</code> (typically <code>title + " " + author + " " + genres</code>).</div>
+    <div id="ingestMsg" class="small"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Search as you type</legend>
+    <div class="row"><input id="q" type="text" placeholder="Type to search…"></div>
+    <div class="row">
+      <label><input id="fuzzy" type="checkbox" checked> fuzzy</label>
+      <label><input id="meta" type="checkbox" checked> include metadata</label>
+      <label>k <input id="k" type="number" min="1" max="100" value="8" style="width:64px"></label>
+    </div>
+    <div id="hits" class="hits"></div>
+  </fieldset>
+</div>
+
+<script>
+(() => {
+  const FLAG_FUZZY = 1 << 0;
+  const FLAG_WITH_META = 1 << 1;
+  const MASK64 = (1n << 64n) - 1n;
+  const te = new TextEncoder();
+  const td = new TextDecoder();
+
+  function normalize(s) {
+    let out = "";
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      const lc = (c >= 65 && c <= 90) ? c + 32 : c;
+      const ok = (lc >= 97 && lc <= 122) || (lc >= 48 && lc <= 57) || lc === 32;
+      out += ok ? String.fromCharCode(lc) : " ";
+    }
+    return out;
+  }
+  function ahash64_gram(g0, g1, g2) {
+    const K0 = 0x9e3779b97f4a7c15n;
+    let v = BigInt(g0) | (BigInt(g1) << 8n) | (BigInt(g2) << 16n);
+    let a = (K0 ^ v) & MASK64;
+    a ^= a >> 33n; a = (a * 0xff51afd7ed558ccdn) & MASK64;
+    a ^= a >> 33n; a = (a * 0xc4ceb9fe1a85ec53n) & MASK64;
+    a ^= a >> 33n;
+    return a & MASK64;
+  }
+  function grams_to_sig4096(s) {
+    const n = normalize(s);
+    const b = te.encode(n);
+    const sig = new BigUint64Array(64);
+    for (let i = 0; i + 2 < b.length; i++) {
+      let x = ahash64_gram(b[i], b[i+1], b[i+2]);
+      for (let t = 0; t < 4; t++) {
+        const bit = Number(x & 0xFFFn);
+        const word = bit >>> 6;
+        const bitpos = bit & 63;
+        sig[word] |= 1n << BigInt(bitpos);
+        x ^= (x << 13n) & MASK64; x ^= x >> 7n; x ^= (x << 17n) & MASK64;
+      }
+    }
+    return sig;
+  }
+  function make_query_bytes(text, k, fuzzy, withMeta) {
+    const sig = grams_to_sig4096(text);
+    const flags = (fuzzy ? FLAG_FUZZY : 0) | (withMeta ? FLAG_WITH_META : 0);
+    const buf = new ArrayBuffer(516);
+    const dv = new DataView(buf);
+    dv.setUint16(0, k, true);
+    dv.setUint16(2, flags, true);
+    let off = 4;
+    for (let i = 0; i < 64; i++) { dv.setBigUint64(off, sig[i], true); off += 8; }
+    return buf;
+  }
+  function parse_hits(buffer, withMeta) {
+    const dv = new DataView(buffer);
+    let off = 0;
+    if (dv.byteLength < 4) return [];
+    const n = dv.getUint32(off, true); off += 4;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      if (off + 8 > dv.byteLength) break;
+      const id = dv.getUint32(off, true); off += 4;
+      const score = dv.getFloat32(off, true); off += 4;
+      if (!withMeta) { out.push({ id, score }); continue; }
+      if (off + 10 > dv.byteLength) break;
+      const tl = dv.getUint16(off, true); off += 2;
+      const al = dv.getUint16(off, true); off += 2;
+      const gl = dv.getUint16(off, true); off += 2;
+      const ul = dv.getUint16(off, true); off += 2;
+      const rl = dv.getUint16(off, true); off += 2;
+      if (off + tl + al + gl + ul + rl > dv.byteLength) break;
+      const title  = td.decode(new Uint8Array(buffer, off, tl)); off += tl;
+      const author = td.decode(new Uint8Array(buffer, off, al)); off += al;
+      const genres = td.decode(new Uint8Array(buffer, off, gl)); off += gl;
+      const url    = td.decode(new Uint8Array(buffer, off, ul)); off += ul;
+      const uri    = td.decode(new Uint8Array(buffer, off, rl)); off += rl;
+      out.push({ id, score, title, author, genres, url, uri });
+    }
+    return out;
+  }
+  function pack_ingest_record(id, search, title, author, genres, url, uri) {
+    const sb = te.encode(search);
+    const tb = te.encode(title);
+    const ab = te.encode(author);
+    const gb = te.encode(genres);
+    const ub = te.encode(url);
+    const rb = te.encode(uri);
+    const buf = new ArrayBuffer(4 + 12 + sb.length + tb.length + ab.length + gb.length + ub.length + rb.length);
+    const dv = new DataView(buf);
+    let off = 0;
+    dv.setUint32(off, id >>> 0, true); off += 4;
+    dv.setUint16(off, sb.length, true); off += 2;
+    dv.setUint16(off, tb.length, true); off += 2;
+    dv.setUint16(off, ab.length, true); off += 2;
+    dv.setUint16(off, gb.length, true); off += 2;
+    dv.setUint16(off, ub.length, true); off += 2;
+    dv.setUint16(off, rb.length, true); off += 2;
+    new Uint8Array(buf, off, sb.length).set(sb); off += sb.length;
+    new Uint8Array(buf, off, tb.length).set(tb); off += tb.length;
+    new Uint8Array(buf, off, ab.length).set(ab); off += ab.length;
+    new Uint8Array(buf, off, gb.length).set(gb); off += gb.length;
+    new Uint8Array(buf, off, ub.length).set(ub); off += ub.length;
+    new Uint8Array(buf, off, rb.length).set(rb); off += rb.length;
+    return buf;
+  }
+
+  const $base = document.getElementById('base');
+  const $gid = document.getElementById('gid');
+  const $title = document.getElementById('title');
+  const $author = document.getElementById('author');
+  const $genres = document.getElementById('genres');
+  const $url = document.getElementById('url');
+  const $uri = document.getElementById('uri');
+  const $ingestBtn = document.getElementById('ingestBtn');
+  const $ingestMsg = document.getElementById('ingestMsg');
+
+  const $q = document.getElementById('q');
+  const $hits = document.getElementById('hits');
+  const $fuzzy = document.getElementById('fuzzy');
+  const $meta = document.getElementById('meta');
+  const $k = document.getElementById('k');
+
+  $ingestBtn.onclick = async () => {
+    const base = ($base.value || "").replace(/\/+$/,'');
+    const gid = parseInt($gid.value || "4294967295", 10) >>> 0; // default auto-id
+    const title = $title.value.trim();
+    const author = $author.value.trim();
+    const genres = $genres.value.trim();
+    const url = $url.value.trim();
+    const uri = $uri.value.trim();
+
+    // Searchable string (ID/URI are NOT part of the grams)
+    const search = `${title} ${author} ${genres}`.trim();
+    if (!search) { $ingestMsg.textContent = "enter at least title/author/genres"; return; }
+
+    $ingestBtn.disabled = true;
+    try {
+      const body = pack_ingest_record(gid, search, title, author, genres, url, uri);
+      const r = await fetch(base + "/ingest.pack", {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body, cache: "no-store",
+      });
+      $ingestMsg.textContent = "ingested: " + (r.headers.get("X-Ingested") || r.status);
+      if ($q.value.trim() === "") { $q.value = title; goSearch(); }
+    } catch (e) {
+      $ingestMsg.textContent = "error: " + e;
+    } finally {
+      $ingestBtn.disabled = false;
+    }
+  };
+
+  let timer = 0;
+  function debounce() {
+    if (timer) cancelAnimationFrame(timer);
+    timer = requestAnimationFrame(() => {
+      clearTimeout(timer);
+      timer = setTimeout(goSearch, 80);
+    });
+  }
+  $q.addEventListener('input', debounce);
+  [$fuzzy, $meta, $k, $base].forEach(el => el.addEventListener('change', goSearch));
+
+  async function goSearch() {
+    const text = $q.value.trim();
+    if (!text) { $hits.innerHTML = ""; return; }
+    const base = ($base.value || "").replace(/\/+$/,'');
+    const withMeta = $meta.checked;
+    const k = Math.max(1, Math.min(100, parseInt($k.value || "8", 10)));
+    const body = make_query_bytes(text, k, $fuzzy.checked, withMeta);
+    try {
+      const r = await fetch(base + "/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body, cache: "no-store",
+      });
+      const buf = await r.arrayBuffer();
+      render(parse_hits(buf, withMeta), withMeta);
+    } catch (e) { console.error(e); }
+  }
+
+  function render(hits, withMeta) {
+    if (!hits.length) { $hits.innerHTML = "<div class=small>No results.</div>"; return; }
+    const rows = hits.map(h => {
+      if (!withMeta) {
+        return `<div class="hit"><b>id</b> ${h.id} <span class="small">score ${h.score.toFixed(3)}</span></div>`;
+      } else {
+        const open = h.url ? ` — <a href="${h.url}" target="_blank">open</a>` : "";
+        return `<div class="hit">
+          <div><b>${esc(h.title||"")}</b> <span class="small">by ${esc(h.author||"")}</span></div>
+          <div class="small">id ${h.id} • ${h.score.toFixed(3)} • genres <code>${esc(h.genres||"")}</code> • uri <code>${esc(h.uri||"")}</code>${open}</div>
+        </div>`;
+      }
+    }).join("");
+    $hits.innerHTML = rows;
+  }
+  function esc(s){return s.replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+})();
+</script>

@@ -1,0 +1,28 @@
+[package]
+name = "strobe"
+version = "0.3.0"
+edition = "2021"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+debug = false
+panic = "abort"
+
+[dependencies]
+tokio = { version = "1.47", features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
+hyper = { version = "1.6", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+http-body-util = "0.1"
+bytes = "1.10"
+ahash = "0.8"
+arc-swap = "1.7"
+flume = { version = "0.11", default-features = false, features = ["async"] }
+mimalloc = "0.1"
+anyhow = "1.0"
+# TLS stack
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
