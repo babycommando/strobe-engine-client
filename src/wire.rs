@@ -1,31 +1,30 @@
 use bytes::BytesMut;
 
-// bit 0 -> enable fuzzy re-rank (Jaccard on 4096-bit signatures)
-pub const FLAG_FUZZY_JACCARD: u16 = 1 << 0;
-// bit 1 -> include metadata (title, author, genres, url, uri) in response
-pub const FLAG_WITH_META: u16 = 1 << 1;
+// Flags
+pub const FLAG_FUZZY_JACCARD: u16 = 1 << 0; // enable fuzzy bump
+pub const FLAG_WITH_META:     u16 = 1 << 1; // include metadata in response
 
-// 4096 bits = 64 u64 values → 64 * 8 bytes = 512 bytes
-// plus k: u16 (2 bytes), flags: u16 (2 bytes) = 4 bytes
-// total size = 516 bytes
-pub const QUERY_LEN: usize = 516;
+// 256-bit query wire: [u16 k][u16 flags][4 * u64 sig] = 4 + 32 = 36 bytes
+pub const QUERY_FIXED_LEN: usize = 36;
 
 #[derive(Clone, Copy)]
-pub struct Query4096 {
+pub struct Query256 {
     pub k: u16,
     pub flags: u16,
-    pub sig: [u64; 64],
+    pub sig: [u64; 4],
 }
 
-impl Query4096 {
+impl Query256 {
+    #[inline]
     pub fn from_bytes(b: &[u8]) -> Self {
-        debug_assert_eq!(b.len(), QUERY_LEN);
-        let k = u16::from_le_bytes([b[0], b[1]]);
+        debug_assert!(b.len() >= QUERY_FIXED_LEN);
+        let k     = u16::from_le_bytes([b[0], b[1]]);
         let flags = u16::from_le_bytes([b[2], b[3]]);
-        let mut sig = [0u64; 64];
-        for i in 0..64 {
-            let start = 4 + i * 8;
-            sig[i] = u64::from_le_bytes(b[start..start + 8].try_into().unwrap());
+        let mut sig = [0u64; 4];
+        let mut off = 4;
+        for i in 0..4 {
+            sig[i] = u64::from_le_bytes(b[off..off+8].try_into().unwrap());
+            off += 8;
         }
         Self { k, flags, sig }
     }
@@ -64,7 +63,7 @@ pub fn encode_hits_binary(
         let row = h.row as usize;
         let gid = seg.meta[row].id;
 
-        // id + score (always present)
+        // id + score
         buf.extend_from_slice(&gid.to_le_bytes());
         buf.extend_from_slice(&h.score.to_le_bytes());
 

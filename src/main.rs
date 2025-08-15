@@ -1,4 +1,5 @@
-// main.rs — with CORS (OPTIONS + headers on all responses)
+// main.rs — h2/h1 + CORS + binary search payload with trailing raw query text
+// Wire: [36 bytes fixed][u16 qlen][qlen bytes utf-8]
 
 use std::{
     env,
@@ -30,8 +31,8 @@ mod ingest;
 mod index;
 mod wire;
 
-use index::{IndexBuilder, IndexView, Segment};
-use wire::{Query4096, encode_hits_binary, QUERY_LEN, FLAG_WITH_META};
+use index::{IndexBuilder, IndexView, Segment, with_query_text};
+use wire::{Query256, encode_hits_binary, QUERY_FIXED_LEN, FLAG_WITH_META};
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -129,13 +130,10 @@ async fn main() -> anyhow::Result<()> {
 fn add_cors<B>(mut resp: Response<B>) -> Response<B> {
     use hyper::header;
     let h = resp.headers_mut();
-    // For your UI (no credentials), "*" is fine and fastest.
     h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header::HeaderValue::from_static("*"));
     h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, header::HeaderValue::from_static("GET,POST,OPTIONS"));
     h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, header::HeaderValue::from_static("Content-Type"));
-    // Let the UI see custom headers like X-Ingested
     h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, header::HeaderValue::from_static("X-Ingested"));
-    // Cache preflight
     h.insert(header::ACCESS_CONTROL_MAX_AGE, header::HeaderValue::from_static("600"));
     resp
 }
@@ -312,30 +310,28 @@ async fn builder_loop(
     }
 }
 
+// ========== /search helpers: read binary payload with optional trailing text ==========
+
 #[inline(always)]
-async fn read_exact_query(mut body: HBody) -> anyhow::Result<[u8; QUERY_LEN]> {
-    let mut out = [0u8; QUERY_LEN];
-    let mut filled = 0usize;
-    while let Some(frame) = body.frame().await.transpose()? {
-        let data = match frame.into_data() {
-            Ok(d) => d,
-            Err(_) => anyhow::bail!("non-data frame"),
-        };
-        let mut rem = data.as_ref();
-        while !rem.is_empty() && filled < QUERY_LEN {
-            let to_copy = core::cmp::min(QUERY_LEN - filled, rem.len());
-            out[filled..filled + to_copy].copy_from_slice(&rem[..to_copy]);
-            filled += to_copy;
-            rem = &rem[to_copy..];
-        }
-        if filled >= QUERY_LEN { return Ok(out); }
+fn parse_query_and_text(buf: &[u8]) -> Result<(Query256, &str), ()> {
+    if buf.len() < QUERY_FIXED_LEN { return Err(()); }
+    let q = Query256::from_bytes(&buf[..QUERY_FIXED_LEN]);
+
+    if buf.len() == QUERY_FIXED_LEN {
+        return Ok((q, "")); // no raw text attached
     }
-    anyhow::bail!("body too short")
+    if buf.len() < QUERY_FIXED_LEN + 2 { return Err(()); }
+    let ql_lo = buf[QUERY_FIXED_LEN];
+    let ql_hi = buf[QUERY_FIXED_LEN + 1];
+    let qlen = u16::from_le_bytes([ql_lo, ql_hi]) as usize;
+    if buf.len() < QUERY_FIXED_LEN + 2 + qlen { return Err(()); }
+    let s = unsafe { std::str::from_utf8_unchecked(&buf[QUERY_FIXED_LEN + 2 .. QUERY_FIXED_LEN + 2 + qlen]) };
+    Ok((q, s))
 }
 
 async fn handle(req: Request<HBody>, app: Arc<AppState>) -> anyhow::Result<Response<Full<Bytes>>> {
     match (req.method(), req.uri().path()) {
-        // ---- CORS preflight for all routes ----
+        // ---- CORS preflight ----
         (&Method::OPTIONS, _) => Ok(cors_no_content()),
 
         (&Method::GET, "/proto") => {
@@ -388,30 +384,22 @@ async fn handle(req: Request<HBody>, app: Arc<AppState>) -> anyhow::Result<Respo
             Ok(add_cors(resp))
         }
 
+        // ======== search: [36 fixed][u16 qlen][qlen utf8] ========
         (&Method::POST, "/search") => {
-            // Strict length check (optional in browsers, but we keep it)
-            if let Some(cl) = req.headers().get(header::CONTENT_LENGTH) {
-                if let Ok(v) = cl.to_str() {
-                    if v != QUERY_LEN.to_string() {
-                        let resp = Response::builder().status(StatusCode::BAD_REQUEST)
-                            .header(header::CONNECTION, "keep-alive")
-                            .body(Full::new(Bytes::from_static(b"need correct QUERY_LEN bytes"))).unwrap();
-                        return Ok(add_cors(resp));
-                    }
-                }
-            }
-            let raw = match read_exact_query(req.into_body()).await {
-                Ok(b) => b,
+            let body = req.into_body().collect().await?.to_bytes();
+            let (q, qtext) = match parse_query_and_text(&body) {
+                Ok(v) => v,
                 Err(_) => {
                     let resp = Response::builder().status(StatusCode::BAD_REQUEST)
                         .header(header::CONNECTION, "keep-alive")
-                        .body(Full::new(Bytes::from_static(b"need correct QUERY_LEN bytes"))).unwrap();
+                        .body(Full::new(Bytes::from_static(b"bad query payload"))).unwrap();
                     return Ok(add_cors(resp));
                 }
             };
-            let q = Query4096::from_bytes(&raw);
+
             let view = app.view.load();
-            let hits = view.search(q);
+            // Stash raw query text in TLS for prefix/exact scoring in index.rs
+            let hits = with_query_text(qtext, || view.search(q));
             let with_meta = (q.flags & FLAG_WITH_META) != 0;
             let bytes = encode_hits_binary(&view, &hits, with_meta);
 

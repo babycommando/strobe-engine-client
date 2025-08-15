@@ -46,66 +46,93 @@
     <div class="row">
       <label><input id="fuzzy" type="checkbox" checked> fuzzy</label>
       <label><input id="meta" type="checkbox" checked> include metadata</label>
-      <label>k <input id="k" type="number" min="1" max="100" value="8" style="width:64px"></label>
+      <label>results <input id="limit" type="number" min="1" max="100" value="8" style="width:64px"></label>
     </div>
     <div id="hits" class="hits"></div>
   </fieldset>
 </div>
 
 <script>
-(() => {
-  const FLAG_FUZZY = 1 << 0;
-  const FLAG_WITH_META = 1 << 1;
-  const MASK64 = (1n << 64n) - 1n;
-  const te = new TextEncoder();
-  const td = new TextDecoder();
-
-  function normalize(s) {
-    let out = "";
-    for (let i = 0; i < s.length; i++) {
-      const c = s.charCodeAt(i);
-      const lc = (c >= 65 && c <= 90) ? c + 32 : c;
-      const ok = (lc >= 97 && lc <= 122) || (lc >= 48 && lc <= 57) || lc === 32;
-      out += ok ? String.fromCharCode(lc) : " ";
-    }
-    return out;
-  }
-  function ahash64_gram(g0, g1, g2) {
-    const K0 = 0x9e3779b97f4a7c15n;
-    let v = BigInt(g0) | (BigInt(g1) << 8n) | (BigInt(g2) << 16n);
-    let a = (K0 ^ v) & MASK64;
-    a ^= a >> 33n; a = (a * 0xff51afd7ed558ccdn) & MASK64;
-    a ^= a >> 33n; a = (a * 0xc4ceb9fe1a85ec53n) & MASK64;
-    a ^= a >> 33n;
-    return a & MASK64;
-  }
-  function grams_to_sig4096(s) {
-    const n = normalize(s);
-    const b = te.encode(n);
-    const sig = new BigUint64Array(64);
-    for (let i = 0; i + 2 < b.length; i++) {
-      let x = ahash64_gram(b[i], b[i+1], b[i+2]);
-      for (let t = 0; t < 4; t++) {
-        const bit = Number(x & 0xFFFn);
-        const word = bit >>> 6;
-        const bitpos = bit & 63;
-        sig[word] |= 1n << BigInt(bitpos);
-        x ^= (x << 13n) & MASK64; x ^= x >> 7n; x ^= (x << 17n) & MASK64;
+    (() => {
+      const FLAG_FUZZY = 1 << 0;
+      const FLAG_WITH_META = 1 << 1;
+      const MASK64 = (1n << 64n) - 1n;
+      const te = new TextEncoder();
+      const td = new TextDecoder();
+    
+      function normalize(s) {
+        let out = "";
+        for (let i = 0; i < s.length; i++) {
+          const c = s.charCodeAt(i);
+          const lc = (c >= 65 && c <= 90) ? c + 32 : c;
+          const ok = (lc >= 97 && lc <= 122) || (lc >= 48 && lc <= 57) || lc === 32;
+          out += ok ? String.fromCharCode(lc) : " ";
+        }
+        return out;
       }
-    }
-    return sig;
-  }
-  function make_query_bytes(text, k, fuzzy, withMeta) {
-    const sig = grams_to_sig4096(text);
-    const flags = (fuzzy ? FLAG_FUZZY : 0) | (withMeta ? FLAG_WITH_META : 0);
-    const buf = new ArrayBuffer(516);
-    const dv = new DataView(buf);
-    dv.setUint16(0, k, true);
-    dv.setUint16(2, flags, true);
-    let off = 4;
-    for (let i = 0; i < 64; i++) { dv.setBigUint64(off, sig[i], true); off += 8; }
-    return buf;
-  }
+    
+      // same mixer as server
+      function mix64_from3(b0, b1, b2) {
+        const K0 = 0x9e3779b97f4a7c15n;
+        const v = BigInt(b0) | (BigInt(b1) << 8n) | (BigInt(b2) << 16n);
+        let a = (K0 ^ v) & MASK64;
+        a ^= a >> 33n; a = (a * 0xff51afd7ed558ccdn) & MASK64;
+        a ^= a >> 33n; a = (a * 0xc4ceb9fe1a85ec53n) & MASK64;
+        a ^= a >> 33n;
+        return a & MASK64;
+      }
+    
+      // Build 4096-bit sig to match server hashing, but we'll only send the first 256 bits (4×u64).
+      function sig4096_from_text(s) {
+        const n = normalize(s);
+        const b = te.encode(n);
+        const sig = new BigUint64Array(64);
+    
+        // 3-grams
+        for (let i = 0; i + 2 < b.length; i++) {
+          let x = mix64_from3(b[i], b[i+1], b[i+2]);
+          for (let t = 0; t < 4; t++) {
+            const bit = Number(x & 0xFFFn);
+            sig[bit >>> 6] |= 1n << BigInt(bit & 63);
+            x ^= (x << 13n) & MASK64; x ^= x >> 7n; x ^= (x << 17n) & MASK64;
+          }
+        }
+        // 2-grams
+        for (let i = 0; i + 1 < b.length; i++) {
+          let x = mix64_from3(b[i], b[i+1], 0);
+          for (let t = 0; t < 4; t++) {
+            const bit = Number(x & 0xFFFn);
+            sig[bit >>> 6] |= 1n << BigInt(bit & 63);
+            x ^= (x << 13n) & MASK64; x ^= x >> 7n; x ^= (x << 17n) & MASK64;
+          }
+        }
+        return sig;
+      }
+    
+      // NEW: Build payload for Query256: [36 fixed][u16 qlen][qlen utf8]
+      function make_query_bytes(text, limit, fuzzy, withMeta) {
+        const full = sig4096_from_text(text);        // match server hash path
+        const flags = (fuzzy ? FLAG_FUZZY : 0) | (withMeta ? FLAG_WITH_META : 0);
+        const qb = te.encode(text);
+    
+        const HEADER = 36; // 2 (k) + 2 (flags) + 4*8 (u64)
+        const buf = new ArrayBuffer(HEADER + 2 + qb.length);
+        const dv = new DataView(buf);
+    
+        // fixed 36
+        dv.setUint16(0, limit, true);
+        dv.setUint16(2, flags, true);
+        let off = 4;
+        // write only the first 4 u64 lanes (256-bit hot path)
+        for (let i = 0; i < 4; i++) { dv.setBigUint64(off, full[i], true); off += 8; }
+    
+        // trailing raw text (used for MUST-prefix/exact ranking)
+        dv.setUint16(off, qb.length, true); off += 2;
+        new Uint8Array(buf, off, qb.length).set(qb);
+    
+        return buf;
+      }
+
   function parse_hits(buffer, withMeta) {
     const dv = new DataView(buffer);
     let off = 0;
@@ -133,6 +160,7 @@
     }
     return out;
   }
+
   function pack_ingest_record(id, search, title, author, genres, url, uri) {
     const sb = te.encode(search);
     const tb = te.encode(title);
@@ -173,7 +201,7 @@
   const $hits = document.getElementById('hits');
   const $fuzzy = document.getElementById('fuzzy');
   const $meta = document.getElementById('meta');
-  const $k = document.getElementById('k');
+  const $limit = document.getElementById('limit');
 
   $ingestBtn.onclick = async () => {
     const base = ($base.value || "").replace(/\/+$/,'');
@@ -184,7 +212,6 @@
     const url = $url.value.trim();
     const uri = $uri.value.trim();
 
-    // Searchable string (ID/URI are NOT part of the grams)
     const search = `${title} ${author} ${genres}`.trim();
     if (!search) { $ingestMsg.textContent = "enter at least title/author/genres"; return; }
 
@@ -214,15 +241,15 @@
     });
   }
   $q.addEventListener('input', debounce);
-  [$fuzzy, $meta, $k, $base].forEach(el => el.addEventListener('change', goSearch));
+  [$fuzzy, $meta, $limit, $base].forEach(el => el.addEventListener('change', goSearch));
 
   async function goSearch() {
     const text = $q.value.trim();
     if (!text) { $hits.innerHTML = ""; return; }
     const base = ($base.value || "").replace(/\/+$/,'');
     const withMeta = $meta.checked;
-    const k = Math.max(1, Math.min(100, parseInt($k.value || "8", 10)));
-    const body = make_query_bytes(text, k, $fuzzy.checked, withMeta);
+    const limit = Math.max(1, Math.min(100, parseInt($limit.value || "8", 10)));
+    const body = make_query_bytes(text, limit, $fuzzy.checked, withMeta);
     try {
       const r = await fetch(base + "/search", {
         method: "POST",
@@ -238,7 +265,7 @@
     if (!hits.length) { $hits.innerHTML = "<div class=small>No results.</div>"; return; }
     const rows = hits.map(h => {
       if (!withMeta) {
-        return `<div class="hit"><b>id</b> ${h.id} <span class="small">score ${h.score.toFixed(3)}</span></div>`;
+        return `<div class="hit"><b>id</b> ${h.id} <span class="small">rel ${h.score.toFixed(3)}</span></div>`;
       } else {
         const open = h.url ? ` — <a href="${h.url}" target="_blank">open</a>` : "";
         return `<div class="hit">
