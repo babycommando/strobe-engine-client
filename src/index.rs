@@ -9,7 +9,7 @@ use crate::wire::{Hit, Query256, FLAG_FUZZY_JACCARD};
 
 #[derive(Clone, Debug)]
 pub struct DocMeta {
-    pub id: u32,         // DISCO global ID (NOT searched)
+    pub id: u32,         // global ID (NOT searched)
     pub title: Arc<str>, // NOT searched (unless included in `search` field)
     pub author: Arc<str>,
     pub genres: Arc<str>,
